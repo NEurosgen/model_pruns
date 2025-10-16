@@ -12,6 +12,8 @@ __all__ = [
     "global_unstructured_prune",
     "layer_unstructured_prune",
     "structured_filter_prune",
+    "random_unstructured_prune",
+    "threshold_prune",
     "report_sparsity",
     "make_pruning_permanent",
 ]
@@ -117,6 +119,56 @@ def structured_filter_prune(
 
     for _, module in _iter_prunable_modules(model, target_types, exclude_name_patterns):
         prune.ln_structured(module, name="weight", amount=amount, n=n, dim=dim)
+
+
+def random_unstructured_prune(
+    model: nn.Module,
+    amount: float = 0.1,
+    *,
+    target_types: Tuple[Type[nn.Module], ...] = DEFAULT_TARGET_MODULES,
+    exclude_name_patterns: Optional[Iterable[str]] = ("lora_", "classifier"),
+) -> None:
+    """Randomly prune parameters in eligible layers.
+
+    While magnitude pruning is usually preferred, random pruning is a simple
+    baseline that can be used for ablation studies or as an initialization step
+    before fine-tuning specialised pruning schedules.
+    """
+
+    if not 0.0 < amount < 1.0:
+        raise ValueError("amount must be within (0, 1)")
+
+    for _, module in _iter_prunable_modules(model, target_types, exclude_name_patterns):
+        prune.random_unstructured(module, name="weight", amount=amount)
+
+
+def threshold_prune(
+    model: nn.Module,
+    threshold: float,
+    *,
+    target_types: Tuple[Type[nn.Module], ...] = DEFAULT_TARGET_MODULES,
+    exclude_name_patterns: Optional[Iterable[str]] = ("lora_", "classifier"),
+    prune_bias: bool = False,
+) -> None:
+    """Zero-out parameters whose magnitude falls below ``threshold``.
+
+    Parameters
+    ----------
+    threshold:
+        Absolute value below which weights are removed.
+    prune_bias:
+        Apply the same thresholding to bias terms when available.
+    """
+
+    if threshold < 0:
+        raise ValueError("threshold must be non-negative")
+
+    for _, module in _iter_prunable_modules(model, target_types, exclude_name_patterns):
+        weight_mask = torch.abs(module.weight) > threshold
+        prune.custom_from_mask(module, name="weight", mask=weight_mask)
+        if prune_bias and hasattr(module, "bias") and module.bias is not None:
+            bias_mask = torch.abs(module.bias) > threshold
+            prune.custom_from_mask(module, name="bias", mask=bias_mask)
 
 
 def report_sparsity(model: nn.Module, target_types: Tuple[Type[nn.Module], ...] = DEFAULT_TARGET_MODULES) -> Dict[str, float]:

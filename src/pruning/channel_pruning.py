@@ -12,6 +12,7 @@ import torch_pruning as tp  # v2.x
 __all__ = [
     "collect_ignored_layers",
     "prune_model_channels",
+    "progressive_channel_pruning",
 ]
 
 
@@ -72,10 +73,18 @@ def _normalize_example_inputs(example_inputs: TensorOrArgs, device: torch.device
 def _resolve_importance(importance: Union[str, tp.importance.Importance]) -> tp.importance.Importance:
     if isinstance(importance, str):
         norm = importance.lower()
-        if norm not in {"l1", "l2"}:
-            raise ValueError("importance must be either 'l1', 'l2' or a torch_pruning.Importance instance")
-        p = 1 if norm == "l1" else 2
-        return tp.importance.MagnitudeImportance(p=p)
+        registry = {
+            "l1": lambda: tp.importance.MagnitudeImportance(p=1),
+            "l2": lambda: tp.importance.MagnitudeImportance(p=2),
+            "taylor": tp.importance.TaylorImportance,
+            "fpgm": tp.importance.FPGMImportance,
+        }
+        if norm not in registry:
+            available = "', '".join(sorted(registry))
+            raise ValueError(
+                f"importance must be one of '{available}' or a torch_pruning.Importance instance"
+            )
+        return registry[norm]()
     if isinstance(importance, tp.importance.Importance):
         return importance
     raise TypeError("importance must be either a string or torch_pruning.importance.Importance instance")
@@ -184,4 +193,57 @@ def prune_model_channels(
         pruned = len(prunable) if global_pruning else len(ch_sparsity_dict)
         print(f"[channel_pruner] Pruned {pruned} convolutional modules (global={global_pruning}).")
 
+    return model
+
+
+def progressive_channel_pruning(
+    model: nn.Module,
+    example_inputs: TensorOrArgs,
+    schedule: Sequence[float],
+    *,
+    warmup_steps: int = 0,
+    **kwargs: Any,
+) -> nn.Module:
+    """Iteratively prune a model following an increasing sparsity ``schedule``.
+
+    This helper repeatedly applies :func:`prune_model_channels`, which is often
+    recommended over a single aggressive pruning step for improved stability.
+
+    Parameters
+    ----------
+    schedule:
+        Iterable with target sparsity values (between ``0`` and ``1``). Values
+        should be sorted in ascending order. Each step reuses the pruned model
+        from the previous iteration.
+    warmup_steps:
+        Number of initial schedule entries that will be skipped. This can be
+        useful when resuming progressive pruning and the early steps have
+        already been applied.
+    kwargs:
+        Additional keyword arguments forwarded to :func:`prune_model_channels`.
+    """
+
+    values = list(schedule)
+    if not values:
+        raise ValueError("schedule must contain at least one sparsity value")
+
+    if warmup_steps < 0:
+        raise ValueError("warmup_steps must be >= 0")
+
+    start_idx = min(len(values), warmup_steps)
+    if start_idx >= len(values):
+        return model
+
+    last_idx = len(values) - 1
+    for idx, amount in enumerate(values[start_idx:], start=start_idx):
+        if not 0.0 < amount < 1.0:
+            raise ValueError("All sparsity values in schedule must be within (0, 1)")
+        verbose = kwargs.get("verbose", True) and idx == last_idx
+        prune_model_channels(
+            model,
+            example_inputs,
+            amount=amount,
+            verbose=verbose,
+            **{k: v for k, v in kwargs.items() if k != "verbose"},
+        )
     return model

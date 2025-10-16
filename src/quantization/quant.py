@@ -25,6 +25,7 @@ __all__ = [
     "fuse_model",
     "quantize_fp16",
     "quantize_bf16",
+    "apply_smooth_quant",
 ]
 
 
@@ -286,3 +287,111 @@ def quantize_bf16(
     """Convert selected modules to ``bfloat16`` precision."""
 
     return _convert_model_dtype(model, torch.bfloat16, modules=modules, inplace=inplace, device=device)
+
+
+def apply_smooth_quant(
+    model: nn.Module,
+    calib_loader: Iterable,
+    *,
+    alpha: float = 0.5,
+    max_batches: int = 64,
+    device: str = "cpu",
+    modules: Optional[Sequence[type[nn.Module]]] = None,
+) -> nn.Module:
+    """Apply SmoothQuant-style rescaling prior to INT8 PTQ flows.
+
+    The method estimates per-channel activation statistics on ``calib_loader``
+    and rescales weights/activations accordingly. Downstream PTQ (for example
+    :func:`ptq_static_int8`) can then leverage the more uniform ranges to reduce
+    quantization error.
+    """
+
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be within [0, 1]")
+
+    target_types: Tuple[type[nn.Module], ...] = tuple(modules) if modules else (nn.Linear, nn.Conv2d)
+    eps = 1e-8
+
+    model.eval().to(device)
+
+    activation_max: Dict[nn.Module, torch.Tensor] = {}
+    handles = []
+
+    def _make_hook(module: nn.Module):
+        def hook(_: nn.Module, inputs: Tuple[torch.Tensor, ...], __: torch.Tensor | Tuple[torch.Tensor, ...]):
+            if not inputs:
+                return
+            x = inputs[0]
+            if not isinstance(x, torch.Tensor):
+                return
+            reduce_dims = tuple(d for d in range(x.ndim) if d != 1)
+            stats = x.detach().abs().amax(dim=reduce_dims)
+            if module in activation_max:
+                activation_max[module] = torch.maximum(activation_max[module], stats)
+            else:
+                activation_max[module] = stats
+
+        return hook
+
+    for module in model.modules():
+        if isinstance(module, target_types):
+            if hasattr(module, "_smooth_quant_pre_handle"):
+                handle = getattr(module, "_smooth_quant_pre_handle")
+                if handle is not None:
+                    handle.remove()
+            handles.append(module.register_forward_hook(_make_hook(module)))
+
+    consumed = 0
+    with torch.no_grad():
+        for batch in calib_loader:
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+            if isinstance(x, torch.Tensor):
+                _ = model(x.to(device))
+            consumed += 1
+            if consumed >= max_batches:
+                break
+
+    for handle in handles:
+        handle.remove()
+
+    for module in model.modules():
+        if module not in activation_max or not isinstance(module, target_types):
+            continue
+
+        weight = module.weight.detach()
+        if isinstance(module, nn.Linear):
+            weight_stats = weight.abs().amax(dim=0)
+            view_shape = (1, -1)
+        else:
+            weight_stats = weight.abs().amax(dim=(0, 2, 3))
+            view_shape = (1, -1, 1, 1)
+
+        act_stats = activation_max[module]
+        if act_stats.ndim == 0:
+            act_stats = act_stats.unsqueeze(0)
+
+        weight_stats = torch.clamp(weight_stats, min=eps)
+        act_stats = torch.clamp(act_stats.to(weight_stats.device), min=eps)
+
+        scale = (act_stats ** alpha) / (weight_stats ** (1 - alpha))
+        scale = torch.clamp(scale, min=eps)
+
+        module.register_buffer("smooth_quant_scale", scale)
+
+        weight_scale = scale.view(view_shape).to(weight.device)
+        module.weight.data = module.weight.data * weight_scale
+
+        def _pre_hook(mod: nn.Module, inputs: Tuple[torch.Tensor, ...]):
+            if not inputs:
+                return None
+            x = inputs[0]
+            if not isinstance(x, torch.Tensor):
+                return None
+            reshape = (1, -1) if isinstance(mod, nn.Linear) else (1, -1, 1, 1)
+            return (x / scale.view(reshape).to(x.device),)
+
+        handle = module.register_forward_pre_hook(_pre_hook)
+        setattr(module, "_smooth_quant_pre_handle", handle)
+
+    model.to("cpu")
+    return model
