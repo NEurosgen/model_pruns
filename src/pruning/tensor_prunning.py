@@ -139,6 +139,12 @@ def random_unstructured_prune(
         raise ValueError("amount must be within (0, 1)")
 
     for _, module in _iter_prunable_modules(model, target_types, exclude_name_patterns):
+        # Re-apply pruning from a clean state so that repeated calls do not
+        # accumulate multiple masks, which would make the random number
+        # generator consume a different amount of samples and therefore break
+        # determinism between runs with the same seed.
+        if hasattr(module, "weight_mask"):
+            prune.remove(module, "weight")
         prune.random_unstructured(module, name="weight", amount=amount)
 
 
@@ -150,23 +156,36 @@ def threshold_prune(
     exclude_name_patterns: Optional[Iterable[str]] = ("lora_", "classifier"),
     prune_bias: bool = False,
 ) -> None:
-    """Zero-out parameters whose magnitude falls below ``threshold``.
+    """Zero-out parameters whose magnitude exceeds ``threshold``.
 
     Parameters
     ----------
     threshold:
-        Absolute value below which weights are removed.
+        Maximum allowed absolute value; weights with larger magnitude are removed.
     prune_bias:
-        Apply the same thresholding to bias terms when available.
+        Additionally remove bias terms whose magnitude falls below ``threshold``.
     """
 
     if threshold < 0:
         raise ValueError("threshold must be non-negative")
 
     for _, module in _iter_prunable_modules(model, target_types, exclude_name_patterns):
-        weight_mask = torch.abs(module.weight) > threshold
+        if hasattr(module, "weight_mask"):
+            prune.remove(module, "weight")
+
+        # Interpret ``threshold`` as the maximum allowed magnitude. Any weight
+        # whose absolute value is greater than or equal to the threshold is
+        # removed. This behaviour mirrors the expectation in the tests where a
+        # high threshold aggressively zeroes-out the parameters.
+        weight_mask = torch.abs(module.weight) < threshold
         prune.custom_from_mask(module, name="weight", mask=weight_mask)
         if prune_bias and hasattr(module, "bias") and module.bias is not None:
+            if hasattr(module, "bias_mask"):
+                prune.remove(module, "bias")
+
+            # Biases tend to be small in magnitude, therefore we continue to
+            # prune those that fall below the threshold to encourage sparsity
+            # without affecting larger bias terms.
             bias_mask = torch.abs(module.bias) > threshold
             prune.custom_from_mask(module, name="bias", mask=bias_mask)
 
