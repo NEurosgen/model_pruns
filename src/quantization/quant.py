@@ -65,49 +65,55 @@ def _collect_fuse_candidates(module: nn.Module, prefix: str = "") -> List[List[s
     Эвристически находит паттерны Conv2d+BatchNorm(+ReLU) для слияния.
     Fusion улучшает скорость и точность квантизации.
     """
+
+    def _from_sequential(seq_module: nn.Sequential, seq_prefix: str) -> List[List[str]]:
+        """Собирает последовательности для слияния внутри nn.Sequential."""
+        sequential_fuse: List[List[str]] = []
+        sub_names = list(seq_module._modules.keys())
+        idx = 0
+
+        while idx < len(sub_names) - 1:
+            first_name = sub_names[idx]
+            second_name = sub_names[idx + 1]
+            first = seq_module._modules[first_name]
+            second = seq_module._modules[second_name]
+
+            if isinstance(first, nn.Conv2d) and isinstance(second, nn.BatchNorm2d):
+                # Проверяем, есть ли ReLU после
+                if idx + 2 < len(sub_names):
+                    third_name = sub_names[idx + 2]
+                    third = seq_module._modules[third_name]
+                    if isinstance(third, (nn.ReLU, nn.ReLU6)):
+                        sequential_fuse.append([
+                            f"{seq_prefix}{first_name}",
+                            f"{seq_prefix}{second_name}",
+                            f"{seq_prefix}{third_name}",
+                        ])
+                        idx += 3
+                        continue
+
+                # Conv+BN без ReLU
+                sequential_fuse.append([
+                    f"{seq_prefix}{first_name}",
+                    f"{seq_prefix}{second_name}",
+                ])
+                idx += 2
+                continue
+
+            idx += 1
+
+        return sequential_fuse
+
     fuse_list: List[List[str]] = []
-    
+
+    if isinstance(module, nn.Sequential):
+        # Обрабатываем сам модуль, чтобы корректно работать и для корневых nn.Sequential
+        fuse_list.extend(_from_sequential(module, prefix))
+
     for name, child in module.named_children():
-        child_prefix = f"{prefix}{name}"
-        
-        if isinstance(child, nn.Sequential):
-            sub_names = list(child._modules.keys())
-            idx = 0
-            
-            while idx < len(sub_names) - 1:
-                first_name = sub_names[idx]
-                second_name = sub_names[idx + 1]
-                first = child._modules[first_name]
-                second = child._modules[second_name]
-                
-                # Ищем Conv+BN или Conv+BN+ReLU
-                if isinstance(first, nn.Conv2d) and isinstance(second, nn.BatchNorm2d):
-                    # Проверяем, есть ли ReLU после
-                    if idx + 2 < len(sub_names):
-                        third_name = sub_names[idx + 2]
-                        third = child._modules[third_name]
-                        if isinstance(third, (nn.ReLU, nn.ReLU6)):
-                            fuse_list.append([
-                                f"{child_prefix}.{first_name}",
-                                f"{child_prefix}.{second_name}",
-                                f"{child_prefix}.{third_name}",
-                            ])
-                            idx += 3
-                            continue
-                    
-                    # Conv+BN без ReLU
-                    fuse_list.append([
-                        f"{child_prefix}.{first_name}",
-                        f"{child_prefix}.{second_name}",
-                    ])
-                    idx += 2
-                    continue
-                
-                idx += 1
-        
-        # Рекурсивно обрабатываем вложенные модули
-        fuse_list.extend(_collect_fuse_candidates(child, prefix=f"{child_prefix}."))
-    
+        child_prefix = f"{prefix}{name}."
+        fuse_list.extend(_collect_fuse_candidates(child, prefix=child_prefix))
+
     return fuse_list
 
 
