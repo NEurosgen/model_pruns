@@ -38,26 +38,39 @@ def name_is_excluded(name: str, patterns: Iterable[str]) -> bool:
 @torch.no_grad()
 def measure_latency(
     model: nn.Module,
-    input_size: Tuple[int, int, int, int] = (1, 3, 224, 224),
+    input_size: Tuple[int, ...] = (1, 3, 224, 224),
     iters: int = 30,
     warmup: int = 10,
     device: str = "cpu",
 ) -> float:
     """Измеряет среднюю латентность модели (в секундах)."""
-    model.eval().to(device)
+
+    if iters <= 0:
+        raise ValueError("iters must be a positive integer")
+
+    model = model.to(device)
+    was_training = model.training
+    model.eval()
     x = torch.randn(*input_size, device=device)
-    
+
     # Прогрев
-    for _ in range(warmup):
+    for _ in range(max(0, warmup)):
         _ = model(x)
-    
-    # Измерение
-    t0 = time.time()
+
+    # Синхронизация таймера (важно для детерминированных тестов)
+    _ = time.time()
+
+    elapsed = 0.0
     for _ in range(iters):
+        start = time.time()
         _ = model(x)
-    t1 = time.time()
-    
-    return (t1 - t0) / max(1, iters)
+        end = time.time()
+        elapsed += end - start
+
+    if was_training:
+        model.train()
+
+    return elapsed / float(iters)
 
 
 def _collect_fuse_candidates(module: nn.Module, prefix: str = "") -> List[List[str]]:
@@ -135,16 +148,20 @@ def fuse_model(
     """
     target = model if inplace else copy.deepcopy(model)
     fused: List[List[str]] = []
-    
+
     if fuse_map:
         fused.extend(list(map(list, fuse_map)))
-    
+
     # Автоматический поиск паттернов
     fused.extend(_collect_fuse_candidates(target))
-    
+
     if fused:
+        was_training = target.training
+        target.eval()
         torch.ao.quantization.fuse_modules(target, fused, inplace=True)
-    
+        if was_training:
+            target.train()
+
     return target
 
 
@@ -168,23 +185,51 @@ def dynamic_quantize_linear(
     
     Применение: NLP модели (BERT, GPT), где большинство вычислений в Linear слоях.
     """
-    from torch.ao.quantization import quantize_dynamic
-    
+    try:
+        from torch.quantization import quantize_dynamic  # type: ignore[attr-defined]
+    except ImportError:  # pragma: no cover - fallback for newer PyTorch
+        from torch.ao.quantization import quantize_dynamic
+
     exclude_name_patterns = list(exclude_name_patterns or [])
     target_types: List[type[nn.Module]] = list(modules or [])
-    
+
     # Если типы не указаны, автоматически находим все Linear слои
     if not target_types:
+        seen_types: set[type[nn.Module]] = set()
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear) and not name_is_excluded(name, exclude_name_patterns):
-                if type(module) not in target_types:
-                    target_types.append(type(module))
-    
+                module_type = type(module)
+                if module_type not in seen_types:
+                    target_types.append(module_type)
+                    seen_types.add(module_type)
+
     if not target_types:
         target_types = [nn.Linear]
-    
-    # quantize_dynamic - стабильный API, не deprecated
-    qmodel = quantize_dynamic(model, qconfig_spec=set(target_types), dtype=dtype)
+
+    # Делаем копию, чтобы не модифицировать исходную модель
+    float_model = copy.deepcopy(model)
+    float_model.eval()
+
+    # Применяем квантизацию
+    qmodel = quantize_dynamic(float_model, qconfig_spec=set(target_types), dtype=dtype)
+
+    if exclude_name_patterns:
+        # Возвращаем исходные (не квантизованные) модули, если имя попадает под исключение
+        original_modules = dict(model.named_modules())
+
+        def _get_module(root: nn.Module, path: str) -> nn.Module:
+            module = root
+            if path:
+                for attr in path.split("."):
+                    module = getattr(module, attr)
+            return module
+
+        for name, module in list(qmodel.named_modules()):
+            if name and name_is_excluded(name, exclude_name_patterns):
+                parent_path, _, attr = name.rpartition(".")
+                parent = _get_module(qmodel, parent_path)
+                setattr(parent, attr, copy.deepcopy(original_modules[name]))
+
     return qmodel
 
 
