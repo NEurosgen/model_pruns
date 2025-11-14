@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.pruning import tensor_prunning as tp
+from  Optimization.src.pruning import tensor_prunning as tp
 
 
 class LinearToy(nn.Module):

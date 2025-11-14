@@ -119,6 +119,7 @@ def load_model_from_checkpoint(
             )
 
     model = create_model(cfg, num_class=num_classes)
+
     state_dict = checkpoint.get("state_dict")
     if not isinstance(state_dict, Mapping):
         raise KeyError("Checkpoint does not contain a valid 'state_dict'")

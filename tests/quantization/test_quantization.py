@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.quantization import quant
+from Optimization.src.quantization import quant
 
 
 def test_name_is_excluded_matches_regex():

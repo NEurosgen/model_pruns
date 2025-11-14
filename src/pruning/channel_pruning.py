@@ -138,9 +138,9 @@ def prune_model_channels(
     importance_fn = _resolve_importance(importance)
 
     exclude_name_patterns = list(exclude_name_patterns or [])
-    for pat in (r"\.base$", r"lora_", r"^model\.classifier"):
-        if pat not in exclude_name_patterns:
-            exclude_name_patterns.append(pat)
+    # for pat in (r"\.base$", r"lora_", r"^model\.classifier"):
+    #     if pat not in exclude_name_patterns:
+    #         exclude_name_patterns.append(pat)
 
     ignored_layers = collect_ignored_layers(model, exclude_name_patterns)
 
@@ -175,6 +175,7 @@ def prune_model_channels(
         grad_ctx = torch.enable_grad()
 
     with grad_ctx:
+        
         pruner = tp.pruner.MagnitudePruner(
             model,
             example_inputs=normalized_inputs,
@@ -247,3 +248,151 @@ def progressive_channel_pruning(
             **{k: v for k, v in kwargs.items() if k != "verbose"},
         )
     return model
+
+
+
+import re
+import torch
+import torch.nn as nn
+import torch.ao.nn.quantized as nnq
+import torch_pruning as tp
+
+# ---------- 1) helpers ----------
+def _is_depthwise(m: nn.Conv2d) -> bool:
+    return isinstance(m, nn.Conv2d) and m.groups == m.in_channels == m.out_channels
+
+def _collect_ignored_layers(model: nn.Module, exclude_name_patterns):
+    pats = [re.compile(p) for p in exclude_name_patterns]
+    ignored = set()
+    for name, m in model.named_modules():
+        if any(p.search(name) for p in pats):
+            ignored.add(m)
+    # глубинные conv лучше не трогать
+    for m in model.modules():
+        if _is_depthwise(m):
+            ignored.add(m)
+    return list(ignored)
+
+def _conv_summary(model):
+    rows = []
+    for n, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            rows.append((n, m.in_channels, m.out_channels, m.groups))
+    return rows
+
+# ---------- 2) ref <-> backend конвертеры c fallback по версиям ----------
+def to_reference_from_backend(qmodel: nn.Module) -> nn.Module:
+    """
+    Превращает backend-quantized граф (с quantized ops) в reference-квант:
+    float Conv/Linear + стобы Quant/DeQuant. Сохраняет текущие scale/zero_point.
+    """
+    # В разных версиях API называется по-разному. Пробуем варианты.
+    # PyTorch 2.1+:
+    try:
+        from torch.ao.quantization.fx._lower_to_native_backend import convert_to_reference_decomposed
+        return convert_to_reference_decomposed(qmodel)
+    except Exception:
+        pass
+    # PyTorch 2.0 / 1.13 (FX):
+    try:
+        from torch.ao.quantization.quantize_fx import convert_to_reference_fx
+        return convert_to_reference_fx(qmodel)
+    except Exception as e:
+        raise RuntimeError(
+            "Не удалось конвертировать модель в reference-режим. "
+            "Нужна версия PyTorch с FX reference quant APIs."
+        ) from e
+
+def lower_reference_to_backend(ref_model: nn.Module) -> nn.Module:
+    """
+    Опускает reference-квант обратно в backend-квант (qnnpack/fbgemm).
+    """
+    # PyTorch 2.1+: lower_to_native_backend
+    try:
+        from torch.ao.quantization.fx._lower_to_native_backend import lower_to_native_backend
+        return lower_to_native_backend(ref_model)
+    except Exception:
+        pass
+    # PyTorch 2.0 / 1.13: convert_fx(..., is_reference=True)
+    try:
+        from torch.ao.quantization.quantize_fx import convert_fx
+        return convert_fx(ref_model)
+    except Exception as e:
+        raise RuntimeError(
+            "Не удалось опустить reference-модель в backend-квант. "
+            "Уточни версию PyTorch: подскажу точный вызов."
+        ) from e
+
+# ---------- 3) основной пайплайн ----------
+def prune_quantized_model(qmodel: nn.Module,
+                          example_inputs,
+                          amount: float = 0.30,
+                          min_out_channels: int = 8,
+                          verbose: bool = True) -> nn.Module:
+    # 1) если модель backend-quantized — переводим в reference (float Conv/Linear + Quant/DeQuant)
+    if any(isinstance(m, (nnq.Conv2d, nnq.Linear)) for m in qmodel.modules()):
+        if verbose:
+            print("[info] Детектирован backend-quantized граф → переводим в reference…")
+        ref = to_reference_from_backend(qmodel)   # твоя функция; должна уметь это делать на твоей версии PT
+    else:
+        ref = qmodel
+
+    ref.eval()
+
+    # 2) диагностика до
+    before = _conv_summary(ref)
+    if verbose:
+        print("[ref] Conv2d BEFORE:")
+        for n, ci, co, g in before[:12]:
+            print(f"  {n:40s} in={ci:4d} out={co:4d} groups={g}")
+        if len(before) > 12:
+            print(f"  ... total convs: {len(before)}")
+
+    # 3) исключения: LoRA/adapter/Dropout/BatchNorm и строгие depthwise
+    exclude = [  r"\.dropout", r"\.bn", r"BatchNorm"]
+    ignored_layers = _collect_ignored_layers(ref, exclude)
+
+    importance = tp.importance.MagnitudeImportance(p=1)
+
+    # 4) формируем per-layer sparsity с учётом min_out_channels (и для Linear — по out_features)
+    ch_sparsity_dict = {}
+    for m in ref.modules():
+        if isinstance(m, nn.Conv2d) and not _is_depthwise(m):
+            max_spr = max(0.0, 1.0 - (min_out_channels / float(m.out_channels)))
+            tgt = min(amount, max_spr)
+            if tgt > 0.0:
+                ch_sparsity_dict[m] = float(tgt)
+        elif isinstance(m, nn.Linear):
+            max_spr = max(0.0, 1.0 - (min_out_channels / float(m.out_features)))
+            tgt = min(amount, max_spr)
+            if tgt > 0.0:
+                ch_sparsity_dict[m] = float(tgt)
+
+    # 5) создаём pruner БЕЗ global_pruning, но с ch_sparsity_dict
+    pruner = tp.pruner.MagnitudePruner(
+        ref,
+        example_inputs=example_inputs,         # тензор или tuple — как в твоём форварде
+        importance=importance,
+        global_pruning=False,                  # критично: False
+        ch_sparsity_dict=ch_sparsity_dict,     # наши цельовые sparsity по слоям
+        ignored_layers=ignored_layers,
+        root_module_types=[nn.Conv2d, nn.Linear],
+    )
+
+    pruner.step()
+
+    # 6) диагностика после
+    after = _conv_summary(ref)
+    if verbose:
+        print("[ref] Conv2d AFTER:")
+        for (n1, ci1, co1, g1), (_, _, co2, _) in zip(before, after):
+            mark = " <-- pruned" if co2 != co1 else ""
+            print(f"  {n1:40s} out {co1:4d} -> {co2:4d}{mark}")
+        total_before = sum(co for _, _, co, _ in before)
+        total_after  = sum(co for _, _, co, _ in after)
+        print(f"[ref] total out_channels: {total_before} -> {total_after} (Δ={total_before-total_after})")
+
+    # 7) возвращаемся в backend-квант
+    q_pruned = lower_reference_to_backend(ref).eval()
+    return q_pruned
+

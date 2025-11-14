@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.pruning import channel_pruning as cp
+from Optimization.src.pruning import channel_pruning as cp
 
 
 class TinyConvNet(nn.Module):

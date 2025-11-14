@@ -237,6 +237,25 @@ def dynamic_quantize_linear(
 # STATIC POST-TRAINING QUANTIZATION (PTQ) - INT8
 # ============================================================================
 
+def _export_for_pt2e(model: nn.Module, example_inputs: Tuple[torch.Tensor, ...]):
+    """
+    Export helper that guarantees an ExportedProgram with `.meta` for PT2E prepare_*.
+    """
+    # Prefer export_for_training (carries calibration/training meta)
+    if hasattr(torch.export, "export_for_training"):
+        exported = torch.export.export_for_training(model, example_inputs)
+    else:
+        # Very old stacks: try export, then verify `.meta`
+        exported = torch.export.export(model, example_inputs)
+
+    if not hasattr(exported, "meta"):
+        raise RuntimeError(
+            "PT2E prepare_* needs ExportedProgram with `.meta`. "
+            "Upgrade PyTorch (≥2.3 recommended) or use export_for_training."
+        )
+    return exported
+
+
 def ptq_static_int8(
     model: nn.Module,
     calib_loader: Iterable,
@@ -246,75 +265,46 @@ def ptq_static_int8(
     num_calib_batches: int = 100,
     per_channel_weights: bool = True,
 ) -> nn.Module:
-    """
-    Статическая пост-тренировочная квантизация в INT8 (PT2E flow).
-    
-    Этапы:
-    1. torch.export.export() - экспортируем модель в стабильный граф
-    2. prepare_pt2e() - вставляем observers для измерения статистики
-    3. Калибровка - прогоняем данные, observers собирают min/max
-    4. convert_pt2e() - заменяем операции на квантизованные
-    
-    Args:
-        model: Модель для квантизации
-        calib_loader: DataLoader с калибровочными данными
-        device: Устройство для калибровки
-        example_input_size: Размер входа для экспорта
-        num_calib_batches: Сколько батчей использовать для калибровки
-        per_channel_weights: True = per-channel (точнее), False = per-tensor (быстрее)
-    
-    Returns:
-        Квантизованная модель (callable nn.Module)
-    """
     from torch.ao.quantization.quantize_pt2e import prepare_pt2e, convert_pt2e
-    from torch.ao.quantization.quantizer.xnnpack_quantizer import (
-        XNNPACKQuantizer,
-        get_symmetric_quantization_config,
-    )
-    
+    try:
+        # ExecuTorch location (new)
+        from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+            XNNPACKQuantizer,
+            get_symmetric_quantization_config,
+        )
+    except Exception:
+        # Fallback for older PyTorch where it still lives under torch.ao.*
+        from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+            XNNPACKQuantizer,
+            get_symmetric_quantization_config,
+        )
+
     model = model.eval().to(device)
     example_inputs = (torch.randn(*example_input_size, device=device),)
-    
-    # 1. Экспорт модели (torch.export требует PyTorch 2.1+)
-    print("Экспортируем модель...")
-    exported = torch.export.export(model, example_inputs)
-    
-    # 2. Настраиваем квантизатор
+
+    print("Exporting model for PT2E (export_for_training preferred)...")
+    exported = _export_for_pt2e(model, example_inputs)
+
     quantizer = XNNPACKQuantizer()
-    
-    # Симметричная квантизация: [-127, 127] для весов и активаций
-    # per_channel=True означает свой scale для каждого выходного канала Conv/Linear
     quantizer.set_global(
         get_symmetric_quantization_config(is_per_channel=per_channel_weights)
     )
-    
-    # 3. Prepare - вставляем observers
-    print("Подготавливаем модель (вставляем observers)...")
+
+    print("prepare_pt2e (insert observers)...")
     prepared = prepare_pt2e(exported, quantizer)
-    
-    # 4. Калибровка - прогоняем данные для сбора статистики
-    print(f"Калибровка на {num_calib_batches} батчах...")
+
+    print(f"Calibrating on {num_calib_batches} batches ...")
     with torch.no_grad():
-        n = 0
-        for batch in calib_loader:
-            # Извлекаем входные данные (обрабатываем разные форматы DataLoader)
+        for i, batch in enumerate(calib_loader):
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-            
-            # prepared - это обёртка ExportedProgram, вызываем .module()
-            prepared.module()(x)
-            
-            n += 1
-            if n >= num_calib_batches:
+            prepared.module()(x.to(device))
+            if i + 1 >= num_calib_batches:
                 break
-    
-    # 5. Convert - заменяем операции на квантизованные
-    print("Конвертируем в квантизованную модель...")
+
+    print("convert_pt2e ...")
     quantized = convert_pt2e(prepared)
-    
-    # Возвращаем обычный nn.Module
-    quantized_module = quantized.module().eval().to("cpu")
-    return quantized_module
+    return quantized.module().eval().to("cpu")
+
 
 
 # ============================================================================
@@ -348,17 +338,18 @@ def qat_int8_prepare(
     Returns:
         Подготовленная модель для обучения (в режиме .train())
     """
+
     from torch.ao.quantization.quantize_pt2e import prepare_qat_pt2e
-    from torch.ao.quantization.quantizer.xnnpack_quantizer import (
-        XNNPACKQuantizer,
-        get_symmetric_quantization_config,
+    from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+    XNNPACKQuantizer as XNNPACKQuantizer,
+    get_symmetric_quantization_config,
     )
     
     model = model.train().to(device)
     example_inputs = (torch.randn(*example_input_size, device=device),)
     
     print("Экспортируем модель для QAT...")
-    exported = torch.export.export(model, example_inputs)
+    exported = torch.export.export_for_training(model, example_inputs)
     
     quantizer = XNNPACKQuantizer()
     quantizer.set_global(
@@ -397,7 +388,8 @@ def qat_int8_convert(
     example_inputs = (torch.randn(*example_input_size, device=device),)
     
     print("Экспортируем обученную QAT модель...")
-    exported = torch.export.export(prepared_model, example_inputs)
+    print("Экспортируем обученную QAT модель (export_for_training)...")
+    exported = torch.export.export_for_training(prepared_model, example_inputs)
     
     print("Конвертируем QAT модель в квантизованную...")
     quantized = convert_pt2e(exported)
